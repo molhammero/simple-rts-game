@@ -755,6 +755,8 @@ class Unit {
     this.pathIndex = 0;
     this.stuckTimer = 0;
     this.buildArrivalDist = 0; // for bulldozer: distance from center to consider arrived
+    // Physics: velocity-based smooth movement
+    this.vx = 0; this.vy = 0;
   }
 
   init(team, type, x, y) {
@@ -782,6 +784,7 @@ class Unit {
     this.pathIndex = 0;
     this.stuckTimer = 0;
     this.buildArrivalDist = 0;
+    this.vx = 0; this.vy = 0;
     this.active = true;
     this.inPool = false;
 
@@ -852,6 +855,7 @@ class Unit {
     this.fx = 0; this.fy = 0;
     this.formTargetX = 0; this.formTargetY = 0;
     this.wasAtkMove = false;
+    this.vx = 0; this.vy = 0;
   }
 }
 
@@ -2284,11 +2288,25 @@ class Game {
     this.separateEntities();
     // Cooperative chain movement (units in a column flow together)
     this.relaxChain();
-    // Clamp all units to world boundaries (closed map)
+    // Clamp max velocity to prevent sudden dashes
     for (const u of this.units) {
       if (!u.isAlive()) continue;
-      u.x = clamp(u.x, u.size, CONFIG.WORLD_W - u.size);
-      u.y = clamp(u.y, u.size, CONFIG.WORLD_H - u.size);
+      const maxV = u.speed * dt * 2 * 1.5;
+      const vMag = Math.sqrt(u.vx * u.vx + u.vy * u.vy);
+      if (vMag > maxV && vMag > 0.01) {
+        u.vx = (u.vx / vMag) * maxV;
+        u.vy = (u.vy / vMag) * maxV;
+      }
+    }
+    // Clamp all units to world boundaries (closed map) + stop velocity at edges
+    for (const u of this.units) {
+      if (!u.isAlive()) continue;
+      const newX = clamp(u.x, u.size, CONFIG.WORLD_W - u.size);
+      const newY = clamp(u.y, u.size, CONFIG.WORLD_H - u.size);
+      if (newX !== u.x) u.vx = 0;
+      if (newY !== u.y) u.vy = 0;
+      u.x = newX;
+      u.y = newY;
     }
     // Clamp all factories to world boundaries
     for (const f of this.factories) {
@@ -2333,6 +2351,15 @@ class Game {
 
       switch (u.state) {
         case State.IDLE: {
+          // Dampen residual velocity to prevent sliding
+          u.vx *= 0.85;
+          u.vy *= 0.85;
+          if (Math.abs(u.vx) > 0.01 || Math.abs(u.vy) > 0.01) {
+            u.x += u.vx;
+            u.y += u.vy;
+          } else {
+            u.vx = 0; u.vy = 0;
+          }
           // Bulldozer never acquires enemies
           if (u.type !== 'BULLDOZER') {
             const enemy = this.findNearestEnemy(u);
@@ -2401,10 +2428,7 @@ class Game {
                 }
                 break;
               }
-              const speed = u.speed * dt * 2;
-              const move = Math.min(speed, d);
-              u.x += (targetX - u.x) / d * move;
-              u.y += (targetY - u.y) / d * move;
+              this.steerUnit(u, targetX, targetY, dt, 30);
             }
             break;
           }
@@ -2412,6 +2436,7 @@ class Game {
           const d = dist(u, {x: targetX, y: targetY});
           if (d < 5) {
             u.state = State.IDLE;
+            u.vx = 0; u.vy = 0;
             if (u.buildTarget) {
               this.startConstruction(u.buildTarget.x, u.buildTarget.y, u.buildTarget.type);
               u.buildTarget = null;
@@ -2428,10 +2453,7 @@ class Game {
               }
               break;
             }
-            const speed = u.speed * dt * 2;
-            const move = Math.min(speed, d);
-            u.x += (targetX - u.x) / d * move;
-            u.y += (targetY - u.y) / d * move;
+            this.steerUnit(u, targetX, targetY, dt, 30);
           }
           break;
         }
@@ -2479,10 +2501,7 @@ class Game {
                 }
                 break;
               }
-              const speed = u.speed * dt * 2;
-              const move = Math.min(speed, sd);
-              u.x += (targetX - u.x) / sd * move;
-              u.y += (targetY - u.y) / sd * move;
+              this.steerUnit(u, targetX, targetY, dt, 30);
             }
           }
           break;
@@ -2531,10 +2550,7 @@ class Game {
           }
           const d = dist(u, u.guardWanderTarget);
           if (d > 5) {
-            const speed = u.speed * dt * 2;
-            const move = Math.min(speed, d);
-            u.x += (u.guardWanderTarget.x - u.x) / d * move;
-            u.y += (u.guardWanderTarget.y - u.y) / d * move;
+            this.steerUnit(u, u.guardWanderTarget.x, u.guardWanderTarget.y, dt, 20);
           }
           break;
         }
@@ -2556,11 +2572,8 @@ class Game {
           }
           const d = dist(u, target);
           if (d > u.range * 1.1) {
-            // Move toward target
-            const speed = u.speed * dt * 2;
-            const move = Math.min(speed, d - u.range * 0.8);
-            u.x += (target.x - u.x) / d * move;
-            u.y += (target.y - u.y) / d * move;
+            // Move toward target using smooth steering
+            this.steerUnit(u, target.x, target.y, dt, u.range * 0.8);
           } else {
             // Attack
             const now = this.gameTime;
@@ -2696,60 +2709,109 @@ class Game {
     for (const v of this.units) {
       if (v === u || !v.isAlive() || v.team !== u.team) continue;
       // MOVING units never block other MOVING units (separation handles overlap)
-      if (v.state === State.MOVING) continue;
+      if (v.state === State.MOVING || v.state === State.ATK_MOVE) continue;
       const tvx = v.x - u.x, tvy = v.y - u.y;
       const tvd = Math.sqrt(tvx * tvx + tvy * tvy);
-      if (tvd > 0.01 && tvd < (u.size + v.size) * 0.9) {
+      if (tvd > 0.01 && tvd < (u.size + v.size) * 0.85) {
         const dot = (uDx * tvx + uDy * tvy) / tvd;
-        if (dot > 0.3) return true;
+        if (dot > 0.25) {
+          // Nudge idle units aside instead of hard-blocking
+          if (v.state === State.IDLE || v.state === State.GUARDING) {
+            const perpX = -uDy, perpY = uDx;
+            const nudge = Math.min((u.size + v.size) * 0.85 - tvd, 1.5);
+            v.x += perpX * nudge * 0.3;
+            v.y += perpY * nudge * 0.3;
+          }
+          return true;
+        }
       }
     }
     return false;
   }
 
+  steerUnit(u, tx, ty, dt, arrivalRadius = 25, speedScale = 1) {
+    const dx = tx - u.x, dy = ty - u.y;
+    const d = Math.sqrt(dx * dx + dy * dy);
+    if (d < 0.5) {
+      // Decelerate to stop
+      u.vx *= 0.7;
+      u.vy *= 0.7;
+      u.x += u.vx;
+      u.y += u.vy;
+      return;
+    }
+    const maxSpeed = u.speed * dt * 2 * speedScale;
+    // Arrival: slow down when close to target
+    const arrivalScale = d < arrivalRadius ? Math.max(d / arrivalRadius, 0.1) : 1;
+    const desiredVx = (dx / d) * maxSpeed * arrivalScale;
+    const desiredVy = (dy / d) * maxSpeed * arrivalScale;
+    // Smooth acceleration toward desired velocity
+    const accelRate = 0.12;
+    u.vx += (desiredVx - u.vx) * accelRate;
+    u.vy += (desiredVy - u.vy) * accelRate;
+    // Apply velocity
+    u.x += u.vx;
+    u.y += u.vy;
+  }
+
   separateEntities() {
-    const SEP = 0.85;
-    // Unit-unit: equal repulsion for all overlapping pairs
-    for (let i = 0; i < this.units.length; i++) {
-      const a = this.units[i];
-      if (!a.isAlive()) continue;
-      for (let j = i + 1; j < this.units.length; j++) {
-        const b = this.units[j];
-        if (!b.isAlive()) continue;
-        const dx = b.x - a.x;
-        const dy = b.y - a.y;
-        const distSq = dx * dx + dy * dy;
-        const minDist = (a.size + b.size) * SEP;
-        if (distSq < minDist * minDist && distSq > 0.01) {
-          const d = Math.sqrt(distSq);
-          const overlap = minDist - d;
-          const nx = dx / d;
-          const ny = dy / d;
-          const push = Math.min(overlap * 0.4, 2.5);
-          a.x -= nx * push;
-          a.y -= ny * push;
-          b.x += nx * push;
-          b.y += ny * push;
+    const SEP = 0.82;
+    const ITERS = 3;
+    for (let iter = 0; iter < ITERS; iter++) {
+      // Unit-unit: mass-based repulsion for all overlapping pairs
+      for (let i = 0; i < this.units.length; i++) {
+        const a = this.units[i];
+        if (!a.isAlive()) continue;
+        for (let j = i + 1; j < this.units.length; j++) {
+          const b = this.units[j];
+          if (!b.isAlive()) continue;
+          const dx = b.x - a.x;
+          const dy = b.y - a.y;
+          const distSq = dx * dx + dy * dy;
+          const minDist = (a.size + b.size) * SEP;
+          if (distSq < minDist * minDist && distSq > 0.01) {
+            const d = Math.sqrt(distSq);
+            const overlap = minDist - d;
+            const nx = dx / d;
+            const ny = dy / d;
+            // Mass-based push: bigger units push smaller ones more
+            const aMass = a.size, bMass = b.size;
+            const totalMass = aMass + bMass;
+            const aPush = Math.min((bMass / totalMass) * overlap * 0.5, 3.0);
+            const bPush = Math.min((aMass / totalMass) * overlap * 0.5, 3.0);
+            a.x -= nx * aPush;
+            a.y -= ny * aPush;
+            b.x += nx * bPush;
+            b.y += ny * bPush;
+            // Dampen velocity into each other (reduces jitter)
+            const aDot = a.vx * (-nx) + a.vy * (-ny);
+            const bDot = b.vx * nx + b.vy * ny;
+            if (aDot > 0) { a.vx -= (-nx) * aDot * 0.3; a.vy -= (-ny) * aDot * 0.3; }
+            if (bDot > 0) { b.vx -= nx * bDot * 0.3; b.vy -= ny * bDot * 0.3; }
+          }
         }
       }
-    }
-    // Unit-factory: units push away from factories
-    for (const u of this.units) {
-      if (!u.isAlive()) continue;
-      for (const f of this.factories) {
-        if (!f.isAlive()) continue;
-        const dx = f.x - u.x;
-        const dy = f.y - u.y;
-        const distSq = dx * dx + dy * dy;
-        const minDist = (u.size + f.size) * SEP;
-        if (distSq < minDist * minDist && distSq > 0.01) {
-          const d = Math.sqrt(distSq);
-          const overlap = minDist - d;
-          const nx = dx / d;
-          const ny = dy / d;
-          const push = Math.min(overlap * 0.4, 2.5);
-          u.x -= nx * push;
-          u.y -= ny * push;
+      // Unit-factory: units push away from factories
+      for (const u of this.units) {
+        if (!u.isAlive()) continue;
+        for (const f of this.factories) {
+          if (!f.isAlive()) continue;
+          const dx = f.x - u.x;
+          const dy = f.y - u.y;
+          const distSq = dx * dx + dy * dy;
+          const minDist = (u.size + f.size) * SEP;
+          if (distSq < minDist * minDist && distSq > 0.01) {
+            const d = Math.sqrt(distSq);
+            const overlap = minDist - d;
+            const nx = dx / d;
+            const ny = dy / d;
+            const push = Math.min(overlap * 0.5, 3.0);
+            u.x -= nx * push;
+            u.y -= ny * push;
+            // Dampen velocity into factory
+            const dot = u.vx * nx + u.vy * ny;
+            if (dot > 0) { u.vx -= nx * dot * 0.5; u.vy -= ny * dot * 0.5; }
+          }
         }
       }
     }
@@ -2772,13 +2834,15 @@ class Game {
         if (dot < 0.2) continue;
         const minDist = (u.size + v.size) * 0.85;
         if (tvd < minDist && v.state === State.IDLE) {
-          const push = Math.min((minDist - tvd) * 0.5, 3);
+          // Gentle push for idle units (reduced to prevent jitter)
+          const push = Math.min((minDist - tvd) * 0.3, 1.5);
           v.x += uDx * push;
           v.y += uDy * push;
         } else if (tvd < minDist * 0.7 && v.state === State.MOVING) {
+          // Reduced lateral slip for moving units
           const perpX = -uDy, perpY = uDx;
           const lateralDot = perpX * (tvy / tvd) + perpY * (tvx / tvd);
-          const slip = Math.min((minDist * 0.7 - tvd) * 0.2, 1);
+          const slip = Math.min((minDist * 0.7 - tvd) * 0.1, 0.5);
           v.x += perpX * slip * lateralDot;
           v.y += perpY * slip * lateralDot;
         }
@@ -2794,7 +2858,8 @@ class Game {
       const fdx = idealX - u.x, fdy = idealY - u.y;
       const fd = Math.sqrt(fdx * fdx + fdy * fdy);
       if (fd > 5 && fd < 200) {
-        const pull = Math.min(fd * 0.03, 1.5);
+        // Smoother formation pull (reduced to fight less with separation)
+        const pull = Math.min(fd * 0.02, 1.0);
         u.x += (fdx / fd) * pull;
         u.y += (fdy / fd) * pull;
       }
