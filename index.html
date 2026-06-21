@@ -2234,7 +2234,7 @@ class Game {
   update(delta, deltaMS) {
     if (this.gameOver) return;
 
-    const dt = delta; // frame delta (normalized to ~1 at 60fps)
+    const dt = Math.min(delta, 2.5); // clamp dt to prevent speed spikes on frame drops
     const dtMs = deltaMS; // milliseconds since last frame
 
     this.gameTime += dtMs;
@@ -2291,14 +2291,14 @@ class Game {
     // Clamp max velocity to prevent sudden dashes
     for (const u of this.units) {
       if (!u.isAlive()) continue;
-      const maxV = u.speed * dt * 2 * 1.5;
+      const maxV = u.speed * dt * 2 * 1.3;
       const vMag = Math.sqrt(u.vx * u.vx + u.vy * u.vy);
       if (vMag > maxV && vMag > 0.01) {
         u.vx = (u.vx / vMag) * maxV;
         u.vy = (u.vy / vMag) * maxV;
       }
     }
-    // Clamp all units to world boundaries (closed map) + stop velocity at edges
+    // Clamp all units to world boundaries + stop velocity at edges
     for (const u of this.units) {
       if (!u.isAlive()) continue;
       const newX = clamp(u.x, u.size, CONFIG.WORLD_W - u.size);
@@ -2352,8 +2352,8 @@ class Game {
       switch (u.state) {
         case State.IDLE: {
           // Dampen residual velocity to prevent sliding
-          u.vx *= 0.85;
-          u.vy *= 0.85;
+          u.vx *= 0.82;
+          u.vy *= 0.82;
           if (Math.abs(u.vx) > 0.01 || Math.abs(u.vy) > 0.01) {
             u.x += u.vx;
             u.y += u.vy;
@@ -2708,17 +2708,17 @@ class Game {
     const uDx = dx / d, uDy = dy / d;
     for (const v of this.units) {
       if (v === u || !v.isAlive() || v.team !== u.team) continue;
-      // MOVING units never block other MOVING units (separation handles overlap)
+      // MOVING and ATK_MOVE units don't block (separation handles overlap)
       if (v.state === State.MOVING || v.state === State.ATK_MOVE) continue;
       const tvx = v.x - u.x, tvy = v.y - u.y;
       const tvd = Math.sqrt(tvx * tvx + tvy * tvy);
       if (tvd > 0.01 && tvd < (u.size + v.size) * 0.85) {
         const dot = (uDx * tvx + uDy * tvy) / tvd;
         if (dot > 0.25) {
-          // Nudge idle units aside instead of hard-blocking
+          // Nudge idle/guarding units aside instead of hard-blocking
           if (v.state === State.IDLE || v.state === State.GUARDING) {
             const perpX = -uDy, perpY = uDx;
-            const nudge = Math.min((u.size + v.size) * 0.85 - tvd, 1.5);
+            const nudge = Math.min((u.size + v.size) * 0.85 - tvd, 1.2);
             v.x += perpX * nudge * 0.3;
             v.y += perpY * nudge * 0.3;
           }
@@ -2729,24 +2729,25 @@ class Game {
     return false;
   }
 
-  steerUnit(u, tx, ty, dt, arrivalRadius = 25, speedScale = 1) {
+  steerUnit(u, tx, ty, dt, arrivalRadius = 28) {
     const dx = tx - u.x, dy = ty - u.y;
     const d = Math.sqrt(dx * dx + dy * dy);
     if (d < 0.5) {
-      // Decelerate to stop
-      u.vx *= 0.7;
-      u.vy *= 0.7;
+      // Close enough: decelerate to stop
+      u.vx *= 0.6;
+      u.vy *= 0.6;
       u.x += u.vx;
       u.y += u.vy;
       return;
     }
-    const maxSpeed = u.speed * dt * 2 * speedScale;
-    // Arrival: slow down when close to target
-    const arrivalScale = d < arrivalRadius ? Math.max(d / arrivalRadius, 0.1) : 1;
+    // Max speed for this frame (clamped dt prevents spikes)
+    const maxSpeed = u.speed * dt * 2;
+    // Arrival: scale down speed when close to target (smooth stop)
+    const arrivalScale = d < arrivalRadius ? Math.max(d / arrivalRadius, 0.08) : 1;
     const desiredVx = (dx / d) * maxSpeed * arrivalScale;
     const desiredVy = (dy / d) * maxSpeed * arrivalScale;
-    // Smooth acceleration toward desired velocity
-    const accelRate = 0.12;
+    // Smooth acceleration toward desired velocity (prevents instant dash)
+    const accelRate = 0.10;
     u.vx += (desiredVx - u.vx) * accelRate;
     u.vy += (desiredVy - u.vy) * accelRate;
     // Apply velocity
@@ -2756,9 +2757,9 @@ class Game {
 
   separateEntities() {
     const SEP = 0.82;
-    const ITERS = 3;
+    const ITERS = 4; // multiple passes to fully resolve overlaps
     for (let iter = 0; iter < ITERS; iter++) {
-      // Unit-unit: mass-based repulsion for all overlapping pairs
+      // Unit-unit: mass-based repulsion
       for (let i = 0; i < this.units.length; i++) {
         const a = this.units[i];
         if (!a.isAlive()) continue;
@@ -2774,24 +2775,24 @@ class Game {
             const overlap = minDist - d;
             const nx = dx / d;
             const ny = dy / d;
-            // Mass-based push: bigger units push smaller ones more
+            // Mass-based: bigger units push smaller ones more
             const aMass = a.size, bMass = b.size;
-            const totalMass = aMass + bMass;
-            const aPush = Math.min((bMass / totalMass) * overlap * 0.5, 3.0);
-            const bPush = Math.min((aMass / totalMass) * overlap * 0.5, 3.0);
+            const total = aMass + bMass;
+            const aPush = Math.min((bMass / total) * overlap * 0.5, 2.5);
+            const bPush = Math.min((aMass / total) * overlap * 0.5, 2.5);
             a.x -= nx * aPush;
             a.y -= ny * aPush;
             b.x += nx * bPush;
             b.y += ny * bPush;
-            // Dampen velocity into each other (reduces jitter)
-            const aDot = a.vx * (-nx) + a.vy * (-ny);
-            const bDot = b.vx * nx + b.vy * ny;
-            if (aDot > 0) { a.vx -= (-nx) * aDot * 0.3; a.vy -= (-ny) * aDot * 0.3; }
-            if (bDot > 0) { b.vx -= nx * bDot * 0.3; b.vy -= ny * bDot * 0.3; }
+            // Dampen velocity component pushing into each other (reduces jitter)
+            const aInto = a.vx * (-nx) + a.vy * (-ny);
+            const bInto = b.vx * nx + b.vy * ny;
+            if (aInto > 0) { a.vx -= (-nx) * aInto * 0.4; a.vy -= (-ny) * aInto * 0.4; }
+            if (bInto > 0) { b.vx -= nx * bInto * 0.4; b.vy -= ny * bInto * 0.4; }
           }
         }
       }
-      // Unit-factory: units push away from factories
+      // Unit-factory
       for (const u of this.units) {
         if (!u.isAlive()) continue;
         for (const f of this.factories) {
@@ -2805,12 +2806,12 @@ class Game {
             const overlap = minDist - d;
             const nx = dx / d;
             const ny = dy / d;
-            const push = Math.min(overlap * 0.5, 3.0);
+            const push = Math.min(overlap * 0.5, 3);
             u.x -= nx * push;
             u.y -= ny * push;
-            // Dampen velocity into factory
-            const dot = u.vx * nx + u.vy * ny;
-            if (dot > 0) { u.vx -= nx * dot * 0.5; u.vy -= ny * dot * 0.5; }
+            // Stop velocity into factory
+            const into = u.vx * nx + u.vy * ny;
+            if (into > 0) { u.vx -= nx * into * 0.5; u.vy -= ny * into * 0.5; }
           }
         }
       }
@@ -2834,12 +2835,12 @@ class Game {
         if (dot < 0.2) continue;
         const minDist = (u.size + v.size) * 0.85;
         if (tvd < minDist && v.state === State.IDLE) {
-          // Gentle push for idle units (reduced to prevent jitter)
-          const push = Math.min((minDist - tvd) * 0.3, 1.5);
+          // Reduced push to fight less with separation
+          const push = Math.min((minDist - tvd) * 0.25, 1.2);
           v.x += uDx * push;
           v.y += uDy * push;
         } else if (tvd < minDist * 0.7 && v.state === State.MOVING) {
-          // Reduced lateral slip for moving units
+          // Reduced lateral slip
           const perpX = -uDy, perpY = uDx;
           const lateralDot = perpX * (tvy / tvd) + perpY * (tvx / tvd);
           const slip = Math.min((minDist * 0.7 - tvd) * 0.1, 0.5);
@@ -2848,7 +2849,7 @@ class Game {
         }
       }
     }
-    // Formation keeping: gently pull MOVING units toward their formation position
+    // Formation keeping: gently pull MOVING units toward formation position
     for (const u of this.units) {
       if (!u.isAlive() || u.state !== State.MOVING) continue;
       if (u.fx === 0 && u.fy === 0) continue;
@@ -2858,7 +2859,7 @@ class Game {
       const fdx = idealX - u.x, fdy = idealY - u.y;
       const fd = Math.sqrt(fdx * fdx + fdy * fdy);
       if (fd > 5 && fd < 200) {
-        // Smoother formation pull (reduced to fight less with separation)
+        // Reduced pull to minimize conflict with separation
         const pull = Math.min(fd * 0.02, 1.0);
         u.x += (fdx / fd) * pull;
         u.y += (fdy / fd) * pull;
