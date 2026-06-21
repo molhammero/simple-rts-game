@@ -755,8 +755,6 @@ class Unit {
     this.pathIndex = 0;
     this.stuckTimer = 0;
     this.buildArrivalDist = 0; // for bulldozer: distance from center to consider arrived
-    // Physics: velocity-based smooth movement
-    this.vx = 0; this.vy = 0;
   }
 
   init(team, type, x, y) {
@@ -784,7 +782,6 @@ class Unit {
     this.pathIndex = 0;
     this.stuckTimer = 0;
     this.buildArrivalDist = 0;
-    this.vx = 0; this.vy = 0;
     this.active = true;
     this.inPool = false;
 
@@ -855,7 +852,6 @@ class Unit {
     this.fx = 0; this.fy = 0;
     this.formTargetX = 0; this.formTargetY = 0;
     this.wasAtkMove = false;
-    this.vx = 0; this.vy = 0;
   }
 }
 
@@ -2288,25 +2284,11 @@ class Game {
     this.separateEntities();
     // Cooperative chain movement (units in a column flow together)
     this.relaxChain();
-    // Clamp max velocity to prevent sudden dashes
+    // Clamp all units to world boundaries (closed map)
     for (const u of this.units) {
       if (!u.isAlive()) continue;
-      const maxV = u.speed * dt * 2 * 1.3;
-      const vMag = Math.sqrt(u.vx * u.vx + u.vy * u.vy);
-      if (vMag > maxV && vMag > 0.01) {
-        u.vx = (u.vx / vMag) * maxV;
-        u.vy = (u.vy / vMag) * maxV;
-      }
-    }
-    // Clamp all units to world boundaries + stop velocity at edges
-    for (const u of this.units) {
-      if (!u.isAlive()) continue;
-      const newX = clamp(u.x, u.size, CONFIG.WORLD_W - u.size);
-      const newY = clamp(u.y, u.size, CONFIG.WORLD_H - u.size);
-      if (newX !== u.x) u.vx = 0;
-      if (newY !== u.y) u.vy = 0;
-      u.x = newX;
-      u.y = newY;
+      u.x = clamp(u.x, u.size, CONFIG.WORLD_W - u.size);
+      u.y = clamp(u.y, u.size, CONFIG.WORLD_H - u.size);
     }
     // Clamp all factories to world boundaries
     for (const f of this.factories) {
@@ -2351,15 +2333,6 @@ class Game {
 
       switch (u.state) {
         case State.IDLE: {
-          // Dampen residual velocity to prevent sliding
-          u.vx *= 0.82;
-          u.vy *= 0.82;
-          if (Math.abs(u.vx) > 0.01 || Math.abs(u.vy) > 0.01) {
-            u.x += u.vx;
-            u.y += u.vy;
-          } else {
-            u.vx = 0; u.vy = 0;
-          }
           // Bulldozer never acquires enemies
           if (u.type !== 'BULLDOZER') {
             const enemy = this.findNearestEnemy(u);
@@ -2428,7 +2401,10 @@ class Game {
                 }
                 break;
               }
-              this.steerUnit(u, targetX, targetY, dt, 30);
+              const speed = u.speed * dt * 2 * this.arrivalSpeed(d, 30);
+              const move = Math.min(speed, d);
+              u.x += (targetX - u.x) / d * move;
+              u.y += (targetY - u.y) / d * move;
             }
             break;
           }
@@ -2436,7 +2412,6 @@ class Game {
           const d = dist(u, {x: targetX, y: targetY});
           if (d < 5) {
             u.state = State.IDLE;
-            u.vx = 0; u.vy = 0;
             if (u.buildTarget) {
               this.startConstruction(u.buildTarget.x, u.buildTarget.y, u.buildTarget.type);
               u.buildTarget = null;
@@ -2453,7 +2428,10 @@ class Game {
               }
               break;
             }
-            this.steerUnit(u, targetX, targetY, dt, 30);
+            const speed = u.speed * dt * 2 * this.arrivalSpeed(d, 30);
+            const move = Math.min(speed, d);
+            u.x += (targetX - u.x) / d * move;
+            u.y += (targetY - u.y) / d * move;
           }
           break;
         }
@@ -2501,7 +2479,10 @@ class Game {
                 }
                 break;
               }
-              this.steerUnit(u, targetX, targetY, dt, 30);
+              const speed = u.speed * dt * 2 * this.arrivalSpeed(sd, 30);
+              const move = Math.min(speed, sd);
+              u.x += (targetX - u.x) / sd * move;
+              u.y += (targetY - u.y) / sd * move;
             }
           }
           break;
@@ -2550,7 +2531,10 @@ class Game {
           }
           const d = dist(u, u.guardWanderTarget);
           if (d > 5) {
-            this.steerUnit(u, u.guardWanderTarget.x, u.guardWanderTarget.y, dt, 20);
+            const speed = u.speed * dt * 2 * this.arrivalSpeed(d, 20);
+            const move = Math.min(speed, d);
+            u.x += (u.guardWanderTarget.x - u.x) / d * move;
+            u.y += (u.guardWanderTarget.y - u.y) / d * move;
           }
           break;
         }
@@ -2572,8 +2556,12 @@ class Game {
           }
           const d = dist(u, target);
           if (d > u.range * 1.1) {
-            // Move toward target using smooth steering
-            this.steerUnit(u, target.x, target.y, dt, u.range * 0.8);
+            // Move toward target with arrival slowdown
+            const chaseDist = d - u.range * 0.8;
+            const speed = u.speed * dt * 2 * this.arrivalSpeed(chaseDist, 40);
+            const move = Math.min(speed, chaseDist);
+            u.x += (target.x - u.x) / d * move;
+            u.y += (target.y - u.y) / d * move;
           } else {
             // Attack
             const now = this.gameTime;
@@ -2718,7 +2706,7 @@ class Game {
           // Nudge idle/guarding units aside instead of hard-blocking
           if (v.state === State.IDLE || v.state === State.GUARDING) {
             const perpX = -uDy, perpY = uDx;
-            const nudge = Math.min((u.size + v.size) * 0.85 - tvd, 1.2);
+            const nudge = Math.min((u.size + v.size) * 0.85 - tvd, 1.0);
             v.x += perpX * nudge * 0.3;
             v.y += perpY * nudge * 0.3;
           }
@@ -2729,37 +2717,18 @@ class Game {
     return false;
   }
 
-  steerUnit(u, tx, ty, dt, arrivalRadius = 28) {
-    const dx = tx - u.x, dy = ty - u.y;
-    const d = Math.sqrt(dx * dx + dy * dy);
-    if (d < 0.5) {
-      // Close enough: decelerate to stop
-      u.vx *= 0.6;
-      u.vy *= 0.6;
-      u.x += u.vx;
-      u.y += u.vy;
-      return;
-    }
-    // Max speed for this frame (clamped dt prevents spikes)
-    const maxSpeed = u.speed * dt * 2;
-    // Arrival: scale down speed when close to target (smooth stop)
-    const arrivalScale = d < arrivalRadius ? Math.max(d / arrivalRadius, 0.08) : 1;
-    const desiredVx = (dx / d) * maxSpeed * arrivalScale;
-    const desiredVy = (dy / d) * maxSpeed * arrivalScale;
-    // Smooth acceleration toward desired velocity (prevents instant dash)
-    const accelRate = 0.10;
-    u.vx += (desiredVx - u.vx) * accelRate;
-    u.vy += (desiredVy - u.vy) * accelRate;
-    // Apply velocity
-    u.x += u.vx;
-    u.y += u.vy;
+  // Arrival slowdown: reduce speed when close to target (prevents dash)
+  // Returns a speed multiplier (0.15 to 1.0) based on distance to target
+  arrivalSpeed(d, radius = 30) {
+    if (d > radius) return 1;
+    return Math.max(d / radius, 0.15);
   }
 
   separateEntities() {
     const SEP = 0.82;
-    const ITERS = 4; // multiple passes to fully resolve overlaps
+    const ITERS = 3; // multiple passes to fully resolve overlaps
     for (let iter = 0; iter < ITERS; iter++) {
-      // Unit-unit: mass-based repulsion
+      // Unit-unit: mass-based repulsion (bigger units push smaller ones more)
       for (let i = 0; i < this.units.length; i++) {
         const a = this.units[i];
         if (!a.isAlive()) continue;
@@ -2775,24 +2744,19 @@ class Game {
             const overlap = minDist - d;
             const nx = dx / d;
             const ny = dy / d;
-            // Mass-based: bigger units push smaller ones more
+            // Mass-based: bigger units push smaller ones proportionally
             const aMass = a.size, bMass = b.size;
             const total = aMass + bMass;
-            const aPush = Math.min((bMass / total) * overlap * 0.5, 2.5);
-            const bPush = Math.min((aMass / total) * overlap * 0.5, 2.5);
+            const aPush = Math.min((bMass / total) * overlap * 0.45, 2.5);
+            const bPush = Math.min((aMass / total) * overlap * 0.45, 2.5);
             a.x -= nx * aPush;
             a.y -= ny * aPush;
             b.x += nx * bPush;
             b.y += ny * bPush;
-            // Dampen velocity component pushing into each other (reduces jitter)
-            const aInto = a.vx * (-nx) + a.vy * (-ny);
-            const bInto = b.vx * nx + b.vy * ny;
-            if (aInto > 0) { a.vx -= (-nx) * aInto * 0.4; a.vy -= (-ny) * aInto * 0.4; }
-            if (bInto > 0) { b.vx -= nx * bInto * 0.4; b.vy -= ny * bInto * 0.4; }
           }
         }
       }
-      // Unit-factory
+      // Unit-factory: units push away from factories
       for (const u of this.units) {
         if (!u.isAlive()) continue;
         for (const f of this.factories) {
@@ -2806,12 +2770,9 @@ class Game {
             const overlap = minDist - d;
             const nx = dx / d;
             const ny = dy / d;
-            const push = Math.min(overlap * 0.5, 3);
+            const push = Math.min(overlap * 0.45, 2.5);
             u.x -= nx * push;
             u.y -= ny * push;
-            // Stop velocity into factory
-            const into = u.vx * nx + u.vy * ny;
-            if (into > 0) { u.vx -= nx * into * 0.5; u.vy -= ny * into * 0.5; }
           }
         }
       }
@@ -2835,12 +2796,10 @@ class Game {
         if (dot < 0.2) continue;
         const minDist = (u.size + v.size) * 0.85;
         if (tvd < minDist && v.state === State.IDLE) {
-          // Reduced push to fight less with separation
-          const push = Math.min((minDist - tvd) * 0.25, 1.2);
+          const push = Math.min((minDist - tvd) * 0.3, 1.5);
           v.x += uDx * push;
           v.y += uDy * push;
         } else if (tvd < minDist * 0.7 && v.state === State.MOVING) {
-          // Reduced lateral slip
           const perpX = -uDy, perpY = uDx;
           const lateralDot = perpX * (tvy / tvd) + perpY * (tvx / tvd);
           const slip = Math.min((minDist * 0.7 - tvd) * 0.1, 0.5);
@@ -2849,7 +2808,7 @@ class Game {
         }
       }
     }
-    // Formation keeping: gently pull MOVING units toward formation position
+    // Formation keeping: gently pull MOVING units toward their formation position
     for (const u of this.units) {
       if (!u.isAlive() || u.state !== State.MOVING) continue;
       if (u.fx === 0 && u.fy === 0) continue;
@@ -2859,7 +2818,6 @@ class Game {
       const fdx = idealX - u.x, fdy = idealY - u.y;
       const fd = Math.sqrt(fdx * fdx + fdy * fdy);
       if (fd > 5 && fd < 200) {
-        // Reduced pull to minimize conflict with separation
         const pull = Math.min(fd * 0.02, 1.0);
         u.x += (fdx / fd) * pull;
         u.y += (fdy / fd) * pull;
